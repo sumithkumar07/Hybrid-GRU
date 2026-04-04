@@ -45,6 +45,15 @@ void softmax(double* raw_logits, double* probs, int n) {
     }
 }
 
+inline double sigmoid(double x) { return 1.0 / (1.0 + std::exp(-x)); }
+
+inline void rmsnorm(double* x, int n) {
+    double ms = 0;
+    for(int i=0; i<n; i++) ms += x[i] * x[i];
+    double rrms = 1.0 / std::sqrt(ms / (double)n + 1e-8);
+    for(int i=0; i<n; i++) x[i] *= rrms;
+}
+
 // Optimized Ternary Matrix Multiplication
 // Instead of w*x, we do: sum += (w == 1) ? x : (w == -1) ? -x : 0
 inline double t_matmul(const tweight* w, const double* x, int n, double scale) {
@@ -81,6 +90,9 @@ struct SovereignBlock {
 
     // Latent Buffers (Only for Training)
     double *L_We=nullptr, *L_Wz=nullptr, *L_Wr=nullptr, *L_Wh=nullptr, *L_Wo=nullptr;
+    
+    // Phase 4: Shared Swarm Memory
+    double *hive_context;
 
     SovereignBlock() {
         We = new tweight[VOCAB * EMBED_DIM];
@@ -90,7 +102,16 @@ struct SovereignBlock {
         Wo = new tweight[VOCAB * HIDDEN];
         
         bz = new double[H_DIM]; br = new double[H_DIM]; bh = new double[H_DIM]; bo = new double[VOCAB];
-        s_e = s_z = s_r = s_h = s_o = 0.05;
+        
+        // Phase 2: Xavier/Glorot Initialization for BitNet 1.58b
+        s_e = 0.1; // Embedding scale remains controlled
+        s_z = std::sqrt(1.0 / (double)GRU_CONCAT);
+        s_r = std::sqrt(1.0 / (double)GRU_CONCAT);
+        s_h = std::sqrt(1.0 / (double)GRU_CONCAT);
+        s_o = std::sqrt(1.0 / (double)HIDDEN);
+        
+        hive_context = new double[H_DIM];
+        std::memset(hive_context, 0, 8 * H_DIM);
     }
 
     void enable_training() {
@@ -101,24 +122,40 @@ struct SovereignBlock {
             L_Wh = new double[H_DIM * GRU_CONCAT];
             L_Wo = new double[VOCAB * HIDDEN];
             // Initialize latent buffers from ternary weights to maintain state
-            for(int i=0; i<VOCAB*EMBED_DIM; i++) L_We[i] = (We[i] == 1) ? s_e : (We[i] == -1) ? -s_e : 0;
-            // ... (others similarly if needed for full resume)
+            auto init_latent = [&](double* latent, tweight* ternary, int n, double scale) {
+                for(int i=0; i<n; i++) latent[i] = (ternary[i] == 1) ? scale : (ternary[i] == -1) ? -scale : 0;
+            };
+            init_latent(L_We, We, VOCAB * EMBED_DIM, s_e);
+            init_latent(L_Wz, Wz, H_DIM * GRU_CONCAT, s_z);
+            init_latent(L_Wr, Wr, H_DIM * GRU_CONCAT, s_r);
+            init_latent(L_Wh, Wh, H_DIM * GRU_CONCAT, s_h);
+            init_latent(L_Wo, Wo, VOCAB * HIDDEN, s_o);
         }
     }
 
     void quantize() {
-        // BitNet 1.58b Quantization: sign(W - mean(W))
-        auto q = [](double* latent, tweight* ternary, int n) {
-            double sum = 0; for(int i=0; i<n; i++) sum += latent[i];
+        // Phase 2: BitNet 1.58b Quantization with Mean-Absolute Scaling
+        auto q = [](double* latent, tweight* ternary, int n, double& scale) {
+            double sum = 0, abs_sum = 0; 
+            for(int i=0; i<n; i++) {
+                sum += latent[i];
+                abs_sum += std::abs(latent[i]);
+            }
             double avg = sum / n;
-            for(int i=0; i<n; i++) ternary[i] = (latent[i] - avg > 0.1) ? 1 : (latent[i] - avg < -0.1) ? -1 : 0;
+            scale = abs_sum / n; // Dynamic Scale factor
+            if (scale < 1e-6) scale = 0.01;
+            
+            for(int i=0; i<n; i++) {
+                double val = latent[i] - avg;
+                ternary[i] = (val > 0.5 * scale) ? 1 : (val < -0.5 * scale) ? -1 : 0;
+            }
         };
         if (L_We) {
-            q(L_We, We, VOCAB * EMBED_DIM);
-            q(L_Wz, Wz, H_DIM * GRU_CONCAT);
-            q(L_Wr, Wr, H_DIM * GRU_CONCAT);
-            q(L_Wh, Wh, H_DIM * GRU_CONCAT);
-            q(L_Wo, Wo, VOCAB * HIDDEN);
+            q(L_We, We, VOCAB * EMBED_DIM, s_e);
+            q(L_Wz, Wz, H_DIM * GRU_CONCAT, s_z);
+            q(L_Wr, Wr, H_DIM * GRU_CONCAT, s_r);
+            q(L_Wh, Wh, H_DIM * GRU_CONCAT, s_h);
+            q(L_Wo, Wo, VOCAB * HIDDEN, s_o);
         }
     }
 
@@ -201,7 +238,7 @@ extern "C" {
                     int idx = i*4 + j;
                     if(idx < n) {
                         int val = (b >> (j*2)) & 0x03;
-                        ternary[idx] = (val == 1) ? 1 : (val == 2) ? -1 : 0;
+                        ternary[idx] = (val == 0) ? -1 : (val == 1) ? 0 : (val == 2) ? 1 : 0;
                     }
                 }
             }
@@ -215,10 +252,19 @@ extern "C" {
         unpack(m->Wo, VOCAB * HIDDEN, m->s_o); f.read((char*)m->bo, 8 * VOCAB);
     }
 
+    EXPORT void sovereign_hive_broadcast(void* master, double* vector) {
+        if(!master || !vector) return;
+        SovereignBlock* m = (SovereignBlock*)master;
+        std::memcpy(m->hive_context, vector, 8 * H_DIM);
+    }
+
     EXPORT int sovereign_tokenize(const char* word) {
-        if(!g_tok || !word) return 0;
-        auto it = g_tok->word_to_id.find(std::string(word));
-        return (it != g_tok->word_to_id.end()) ? it->second : 0;
+        if(!g_tok || !word) return TOK_PAD;
+        std::vector<int> tokens = g_tok->encode(std::string(word));
+        // encode returns [START, T1, T2, ..., END]
+        // We want the first actual token if it exists
+        if (tokens.size() > 2) return tokens[1];
+        return TOK_UNK;
     }
 
     EXPORT const char* sovereign_detokenize(int idx) {
@@ -233,6 +279,15 @@ extern "C" {
         std::mt19937 g(42);
         std::uniform_real_distribution<double> d(-1.0, 1.0);
         for(int i=0; i<VOCAB*EMBED_DIM; i++) b->We[i] = (d(g) > 0) ? 1 : -1;
+        for(int i=0; i<H_DIM*GRU_CONCAT; i++) b->Wz[i] = (d(g) > 0) ? 1 : -1;
+        for(int i=0; i<H_DIM*GRU_CONCAT; i++) b->Wr[i] = (d(g) > 0) ? 1 : -1;
+        for(int i=0; i<H_DIM*GRU_CONCAT; i++) b->Wh[i] = (d(g) > 0) ? 1 : -1;
+        for(int i=0; i<VOCAB*HIDDEN; i++)     b->Wo[i] = (d(g) > 0) ? 1 : -1;
+
+        std::memset(b->bz, 0, 8 * H_DIM);
+        std::memset(b->br, 0, 8 * H_DIM);
+        std::memset(b->bh, 0, 8 * H_DIM);
+        std::memset(b->bo, 0, 8 * VOCAB);
         return (void*)b;
     }
 
@@ -251,23 +306,35 @@ extern "C" {
         }
         softmax(a->logits, a->probs, VOCAB);
 
-        // Targeted Backprop (Inplace Latent Weight Update)
+        // 1. Output Gradient (Softmax -> Logits)
+        double dh[H_DIM];
+        std::memset(dh, 0, 8 * H_DIM);
+        
         #pragma omp parallel for
         for(int v=0; v<VOCAB; v++) {
             double grad = a->probs[v] - (double)teacher_probs[v];
-            
-            // L2 Penalty (0.01) - Neural Pressure Valve
-            double l2_lambda = 0.01;
-            
             for(int k=0; k<HIDDEN; k++) {
-                double weight = a->m->L_Wo[v * HIDDEN + k];
-                a->m->L_Wo[v * HIDDEN + k] -= lr * (grad * a->h[k] + l2_lambda * weight);
-                
-                // Absolute Clip (Neural Hardening)
-                if (a->m->L_Wo[v * HIDDEN + k] > 2.0) a->m->L_Wo[v * HIDDEN + k] = 2.0;
-                if (a->m->L_Wo[v * HIDDEN + k] < -2.0) a->m->L_Wo[v * HIDDEN + k] = -2.0;
+                // Update Wo (Latent)
+                a->m->L_Wo[v * HIDDEN + k] -= lr * (grad * a->h[k] + 0.001 * a->m->L_Wo[v * HIDDEN + k]);
+                // Accumulate dh for recurrent backprop
+                // We use the ternary value or a surrogate for the gradient
+                tweight w = a->m->Wo[v * HIDDEN + k];
+                dh[k] += grad * ((w == 1) ? a->m->s_o : (w == -1) ? -a->m->s_o : 0);
             }
             a->m->bo[v] -= lr * grad;
+        }
+
+        // 2. Simple GRU BPTT (1-step approximation)
+        // Updating Wz, Wr, Wh based on how they contributed to the current h
+        #pragma omp parallel for
+        for(int k=0; k<H_DIM; k++) {
+            double dh_local = dh[k] * lr; // Scaled local gradient
+            // We'll update the first 128 elements of the concat buffer (Simplified contribution)
+            for(int j=0; j<GRU_CONCAT; j++) {
+                a->m->L_Wz[k * GRU_CONCAT + j] -= dh_local * 0.1; 
+                a->m->L_Wr[k * GRU_CONCAT + j] -= dh_local * 0.1;
+                a->m->L_Wh[k * GRU_CONCAT + j] -= dh_local * 0.1;
+            }
         }
     }
 
@@ -355,14 +422,27 @@ extern "C" {
                 gru_in[d] = (w == 1) ? a->m->s_e : (w == -1) ? -a->m->s_e : 0;
             }
             double h_new[H_DIM];
+            double zsv[H_DIM], rsv[H_DIM];
+            double concat[GRU_CONCAT];
+            std::memcpy(concat, gru_in, sizeof(double) * EMBED_DIM);
+            std::memcpy(concat + EMBED_DIM, a->h, sizeof(double) * H_DIM);
+
             #pragma omp parallel for
             for(int k=0; k<H_DIM; k++) {
-                double pz = a->m->bz[k] + t_matmul(&a->m->Wz[k * GRU_CONCAT], gru_in, EMBED_DIM, a->m->s_z);
-                double pr = a->m->br[k] + t_matmul(&a->m->Wr[k * GRU_CONCAT], gru_in, EMBED_DIM, a->m->s_r);
-                double z = sigmoid(pz);
-                double phc = a->m->bh[k] + t_matmul(&a->m->Wh[k * GRU_CONCAT], gru_in, EMBED_DIM, a->m->s_h);
-                h_new[k] = (1.0-z)*a->h[k] + z*std::tanh(phc + (a->f->personality_bias[k] * 0.1f));
+                zsv[k] = sigmoid(a->m->bz[k] + t_matmul(&a->m->Wz[k * GRU_CONCAT], concat, GRU_CONCAT, a->m->s_z));
+                rsv[k] = sigmoid(a->m->br[k] + t_matmul(&a->m->Wr[k * GRU_CONCAT], concat, GRU_CONCAT, a->m->s_r));
             }
+
+            double concat_h[GRU_CONCAT];
+            std::memcpy(concat_h, gru_in, sizeof(double) * EMBED_DIM);
+            for(int j=0; j<H_DIM; j++) concat_h[EMBED_DIM + j] = rsv[j] * a->h[j];
+
+            #pragma omp parallel for
+            for(int k=0; k<H_DIM; k++) {
+                double phc = a->m->bh[k] + t_matmul(&a->m->Wh[k * GRU_CONCAT], concat_h, GRU_CONCAT, a->m->s_h);
+                h_new[k] = (1.0-zsv[k])*a->h[k] + zsv[k]*std::tanh(phc + (a->f->personality_bias[k] * 0.1f) + (a->m->hive_context[k] * 0.1f));
+            }
+            rmsnorm(h_new, H_DIM);
             std::memcpy(a->h, h_new, 8*H_DIM);
         }
     }
@@ -380,14 +460,27 @@ extern "C" {
                 gru_in[d] = (w == 1) ? a->m->s_e : (w == -1) ? -a->m->s_e : 0;
             }
             double h_new[H_DIM];
+            double zsv[H_DIM], rsv[H_DIM];
+            double concat[GRU_CONCAT];
+            std::memcpy(concat, gru_in, sizeof(double) * EMBED_DIM);
+            std::memcpy(concat + EMBED_DIM, a->h, sizeof(double) * H_DIM);
+
             #pragma omp parallel for
             for(int k=0; k<H_DIM; k++) {
-                double pz = a->m->bz[k] + t_matmul(&a->m->Wz[k * GRU_CONCAT], gru_in, EMBED_DIM, a->m->s_z);
-                double pr = a->m->br[k] + t_matmul(&a->m->Wr[k * GRU_CONCAT], gru_in, EMBED_DIM, a->m->s_r);
-                double z = sigmoid(pz);
-                double phc = a->m->bh[k] + t_matmul(&a->m->Wh[k * GRU_CONCAT], gru_in, EMBED_DIM, a->m->s_h);
-                h_new[k] = (1.0-z)*a->h[k] + z*std::tanh(phc + (a->f->personality_bias[k] * 0.1f));
+                zsv[k] = sigmoid(a->m->bz[k] + t_matmul(&a->m->Wz[k * GRU_CONCAT], concat, GRU_CONCAT, a->m->s_z));
+                rsv[k] = sigmoid(a->m->br[k] + t_matmul(&a->m->Wr[k * GRU_CONCAT], concat, GRU_CONCAT, a->m->s_r));
             }
+
+            double concat_h[GRU_CONCAT];
+            std::memcpy(concat_h, gru_in, sizeof(double) * EMBED_DIM);
+            for(int j=0; j<H_DIM; j++) concat_h[EMBED_DIM + j] = rsv[j] * a->h[j];
+
+            #pragma omp parallel for
+            for(int k=0; k<H_DIM; k++) {
+                double phc = a->m->bh[k] + t_matmul(&a->m->Wh[k * GRU_CONCAT], concat_h, GRU_CONCAT, a->m->s_h);
+                h_new[k] = (1.0-zsv[k])*a->h[k] + zsv[k]*std::tanh(phc + (a->f->personality_bias[k] * 0.1f) + (a->m->hive_context[k] * 0.1f));
+            }
+            rmsnorm(h_new, H_DIM);
             std::memcpy(a->h, h_new, 8*H_DIM);
             for(int v=0; v<VOCAB; v++) {
                 a->logits[v] = t_matmul(&a->m->Wo[v * HIDDEN], a->h, HIDDEN, a->m->s_o) + a->m->bo[v];
@@ -404,6 +497,11 @@ extern "C" {
         std::string res = g_tok->decode(response);
         std::strncpy(out, res.c_str(), 8191);
         return out;
+    }
+
+    EXPORT double* sovereign_agent_get_h(void* agent_ptr) {
+        if(!agent_ptr) return nullptr;
+        return ((Agent*)agent_ptr)->h;
     }
 
     EXPORT void sovereign_free_agent(void* a) {
