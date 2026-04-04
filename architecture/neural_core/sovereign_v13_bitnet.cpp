@@ -11,6 +11,13 @@
 #include <omp.h>
 #include "tokenizer.h"
 
+#ifdef _WIN32
+#define SOV_API extern "C" __declspec(dllexport)
+#else
+#define SOV_API extern "C"
+#endif
+
+
 // --- DIMENSIONS ---
 static const int VOCAB = 50257; // GPT-2 Standard Vocabulary size
 static const int EMBED_DIM = 256;
@@ -22,8 +29,8 @@ static const int HIDDEN = 1024;
 // Ternary weights: -1, 0, 1 stored as int8_t for 2-bit efficiency
 typedef int8_t tweight; 
 
-inline double sigmoid(double x) { return 1.0 / (1.0 + std::exp(-x)); }
-inline double relu(double x) { return x > 0 ? x : 0; }
+inline double sov_sigmoid(double x) { return 1.0 / (1.0 + std::exp(-x)); }
+inline double sov_relu(double x) { return x > 0 ? x : 0; }
 
 void softmax(double* raw_logits, double* probs, int n) {
     double max_l = -1e9;
@@ -70,7 +77,19 @@ inline double t_matmul(const tweight* w, const double* x, int n, double scale) {
 struct Fragment {
     std::string agent_id;
     float personality_bias[H_DIM];
-    double h_memory[H_DIM]; // Memory Anchor (Persistent H-State)
+    double h_memory[H_DIM]; 
+
+    // Phase 7: Archival Memory (Long-Term Vector Store)
+    double* h_archive = nullptr;
+    int archive_count = 0;
+    int archive_head = 0;
+    const int ARCHIVE_CAP = 1024;
+
+    Fragment() {
+        h_archive = new double[ARCHIVE_CAP * H_DIM];
+        std::memset(h_archive, 0, sizeof(double) * ARCHIVE_CAP * H_DIM);
+    }
+    ~Fragment() { delete[] h_archive; }
 };
 
 // --- SOVEREIGN V13 ENGINE ---
@@ -187,13 +206,14 @@ struct Agent {
 static WordTokenizer* g_tok = nullptr;
 
 #ifdef _WIN32
-#define EXPORT __declspec(dllexport)
+#define SOV_API __declspec(dllexport)
 #else
-#define EXPORT
+#define SOV_API 
 #endif
 
 extern "C" {
-    EXPORT void sovereign_save_compact(void* master, const char* path) {
+
+SOV_API void sovereign_save_compact(void* master, const char* path) {
         if(!master || !path) return;
         SovereignBlock* m = (SovereignBlock*)master;
         std::ofstream f(path, std::ios::binary); if(!f) return;
@@ -219,7 +239,7 @@ extern "C" {
         pack(m->Wo, VOCAB * HIDDEN, m->s_o); f.write((char*)m->bo, 8 * VOCAB);
     }
 
-    EXPORT void sovereign_load_compact(void* master, const char* path) {
+    SOV_API void sovereign_load_compact(void* master, const char* path) {
         if(!master || !path) return;
         SovereignBlock* m = (SovereignBlock*)master;
         std::ifstream f(path, std::ios::binary); if(!f) return;
@@ -252,13 +272,14 @@ extern "C" {
         unpack(m->Wo, VOCAB * HIDDEN, m->s_o); f.read((char*)m->bo, 8 * VOCAB);
     }
 
-    EXPORT void sovereign_hive_broadcast(void* master, double* vector) {
+
+    SOV_API void sovereign_hive_broadcast(void* master, double* vector) {
         if(!master || !vector) return;
         SovereignBlock* m = (SovereignBlock*)master;
         std::memcpy(m->hive_context, vector, 8 * H_DIM);
     }
 
-    EXPORT int sovereign_tokenize(const char* word) {
+    SOV_API int sovereign_tokenize(const char* word) {
         if(!g_tok || !word) return TOK_PAD;
         std::vector<int> tokens = g_tok->encode(std::string(word));
         // encode returns [START, T1, T2, ..., END]
@@ -267,12 +288,12 @@ extern "C" {
         return TOK_UNK;
     }
 
-    EXPORT const char* sovereign_detokenize(int idx) {
+    SOV_API const char* sovereign_detokenize(int idx) {
         if(!g_tok || idx < 0 || idx >= (int)g_tok->id_to_word.size()) return "";
         return g_tok->id_to_word[idx].c_str();
     }
 
-    EXPORT void* sovereign_init_master() {
+    SOV_API void* sovereign_init_master() {
         if(!g_tok) { g_tok = new WordTokenizer(); g_tok->load_vocab("vocab.txt"); }
         SovereignBlock* b = new SovereignBlock(); 
         // Zero-RAM randomization: initialize ternary directly or enable training temporarily
@@ -291,12 +312,12 @@ extern "C" {
         return (void*)b;
     }
 
-    EXPORT void sovereign_free_master(void* master) {
+    SOV_API void sovereign_free_master(void* master) {
         if(!master) return;
         delete (SovereignBlock*)master;
     }
 
-    EXPORT void sovereign_train_step_distill(void* agent_ptr, int input_token, float* teacher_probs, float lr) {
+    SOV_API void sovereign_train_step_distill(void* agent_ptr, int input_token, float* teacher_probs, float lr) {
         if(!agent_ptr || !teacher_probs) return;
         Agent* a = (Agent*)agent_ptr;
         
@@ -338,7 +359,7 @@ extern "C" {
         }
     }
 
-    EXPORT void sovereign_train_distill_bulk(void* agent_ptr, int* tokens, int n, float lr) {
+    SOV_API void sovereign_train_distill_bulk(void* agent_ptr, int* tokens, int n, float lr) {
         if(!agent_ptr || !tokens) return;
         Agent* a = (Agent*)agent_ptr;
         a->m->enable_training();
@@ -355,7 +376,7 @@ extern "C" {
         a->m->quantize();
     }
 
-    EXPORT void* sovereign_init_fragment(const char* id) {
+    SOV_API void* sovereign_init_fragment(const char* id) {
         if(!id) return nullptr;
         Fragment* f = new Fragment();
         f->agent_id = std::string(id);
@@ -364,31 +385,31 @@ extern "C" {
         return (void*)f;
     }
 
-    EXPORT void sovereign_set_fragment_bias(void* fragment_ptr, float* bias_data) {
+    SOV_API void sovereign_set_fragment_bias(void* fragment_ptr, float* bias_data) {
         if(!fragment_ptr || !bias_data) return;
         std::memcpy(((Fragment*)fragment_ptr)->personality_bias, bias_data, 4 * H_DIM);
     }
 
-    EXPORT float* sovereign_get_fragment_bias(void* fragment_ptr) {
+    SOV_API float* sovereign_get_fragment_bias(void* fragment_ptr) {
         if(!fragment_ptr) return nullptr;
         return ((Fragment*)fragment_ptr)->personality_bias;
     }
 
-    EXPORT void sovereign_agent_save_state(void* agent_ptr, void* fragment_ptr) {
+    SOV_API void sovereign_agent_save_state(void* agent_ptr, void* fragment_ptr) {
         if(!agent_ptr || !fragment_ptr) return;
         Agent* a = (Agent*)agent_ptr;
         Fragment* f = (Fragment*)fragment_ptr;
         std::memcpy(f->h_memory, a->h, 8 * H_DIM);
     }
 
-    EXPORT void sovereign_agent_load_state(void* agent_ptr, void* fragment_ptr) {
+    SOV_API void sovereign_agent_load_state(void* agent_ptr, void* fragment_ptr) {
         if(!agent_ptr || !fragment_ptr) return;
         Agent* a = (Agent*)agent_ptr;
         Fragment* f = (Fragment*)fragment_ptr;
         std::memcpy(a->h, f->h_memory, 8 * H_DIM);
     }
 
-    EXPORT void sovereign_agent_set_fragment(void* agent_ptr, void* fragment_ptr) {
+    SOV_API void sovereign_agent_set_fragment(void* agent_ptr, void* fragment_ptr) {
         if(!agent_ptr || !fragment_ptr) return;
         Agent* a = (Agent*)agent_ptr;
         
@@ -402,7 +423,7 @@ extern "C" {
         sovereign_agent_load_state(agent_ptr, fragment_ptr);
     }
 
-    EXPORT void* sovereign_init_agent(const char* id, void* master, int seed) {
+    SOV_API void* sovereign_init_agent(const char* id, void* master, int seed) {
         if(!id || !master) return nullptr;
         Fragment* f = new Fragment();
         f->agent_id = std::string(id);
@@ -410,7 +431,7 @@ extern "C" {
         return (void*)new Agent((SovereignBlock*)master, f, seed);
     }
 
-    EXPORT void sovereign_agent_observe(void* agent_ptr, const char* text) {
+    SOV_API void sovereign_agent_observe(void* agent_ptr, const char* text) {
         if(!text || !agent_ptr) return;
         Agent* a = (Agent*)agent_ptr;
         std::vector<int> tokens = g_tok->encode(std::string(text));
@@ -429,8 +450,8 @@ extern "C" {
 
             #pragma omp parallel for
             for(int k=0; k<H_DIM; k++) {
-                zsv[k] = sigmoid(a->m->bz[k] + t_matmul(&a->m->Wz[k * GRU_CONCAT], concat, GRU_CONCAT, a->m->s_z));
-                rsv[k] = sigmoid(a->m->br[k] + t_matmul(&a->m->Wr[k * GRU_CONCAT], concat, GRU_CONCAT, a->m->s_r));
+                zsv[k] = sov_sigmoid(a->m->bz[k] + t_matmul(&a->m->Wz[k * GRU_CONCAT], concat, GRU_CONCAT, a->m->s_z));
+                rsv[k] = sov_sigmoid(a->m->br[k] + t_matmul(&a->m->Wr[k * GRU_CONCAT], concat, GRU_CONCAT, a->m->s_r));
             }
 
             double concat_h[GRU_CONCAT];
@@ -447,7 +468,7 @@ extern "C" {
         }
     }
 
-    EXPORT const char* sovereign_agent_act(void* agent_ptr, int max_len, double temp) {
+    SOV_API const char* sovereign_agent_act(void* agent_ptr, int max_len, double temp) {
         if(!agent_ptr) return "";
         Agent* a = (Agent*)agent_ptr;
         std::vector<int> response;
@@ -467,8 +488,8 @@ extern "C" {
 
             #pragma omp parallel for
             for(int k=0; k<H_DIM; k++) {
-                zsv[k] = sigmoid(a->m->bz[k] + t_matmul(&a->m->Wz[k * GRU_CONCAT], concat, GRU_CONCAT, a->m->s_z));
-                rsv[k] = sigmoid(a->m->br[k] + t_matmul(&a->m->Wr[k * GRU_CONCAT], concat, GRU_CONCAT, a->m->s_r));
+                zsv[k] = sov_sigmoid(a->m->bz[k] + t_matmul(&a->m->Wz[k * GRU_CONCAT], concat, GRU_CONCAT, a->m->s_z));
+                rsv[k] = sov_sigmoid(a->m->br[k] + t_matmul(&a->m->Wr[k * GRU_CONCAT], concat, GRU_CONCAT, a->m->s_r));
             }
 
             double concat_h[GRU_CONCAT];
@@ -499,12 +520,58 @@ extern "C" {
         return out;
     }
 
-    EXPORT double* sovereign_agent_get_h(void* agent_ptr) {
+    SOV_API double* sovereign_agent_get_h(void* agent_ptr) {
         if(!agent_ptr) return nullptr;
         return ((Agent*)agent_ptr)->h;
     }
 
-    EXPORT void sovereign_free_agent(void* a) {
+    SOV_API void sovereign_agent_commit_memory(void* agent_ptr) {
+        if(!agent_ptr) return;
+        Agent* a = (Agent*)agent_ptr;
+        Fragment* f = a->f;
+        
+        // Snapshot current h into archive
+        std::memcpy(&f->h_archive[f->archive_head * H_DIM], a->h, sizeof(double) * H_DIM);
+        
+        f->archive_head = (f->archive_head + 1) % f->ARCHIVE_CAP;
+        if(f->archive_count < f->ARCHIVE_CAP) f->archive_count++;
+    }
+
+    SOV_API float sovereign_agent_recall_memory(void* agent_ptr, float alpha) {
+        if(!agent_ptr || alpha <= 0.0f) return 0.0f;
+        Agent* a = (Agent*)agent_ptr;
+        Fragment* f = a->f;
+        if(f->archive_count == 0) return 0.0f;
+
+        int best_idx = -1;
+        double max_sim = -1e9;
+
+        // Search Archive for most similar state (Cosine Similarity based on normalized h)
+        #pragma omp parallel for
+        for(int i=0; i<f->archive_count; i++) {
+            double dot = 0;
+            for(int k=0; k<H_DIM; k++) dot += a->h[k] * f->h_archive[i * H_DIM + k];
+            
+            #pragma omp critical
+            {
+                if(dot > max_sim) {
+                    max_sim = dot;
+                    best_idx = i;
+                }
+            }
+        }
+
+        // Restore / Blend Memory
+        if(best_idx != -1) {
+            for(int k=0; k<H_DIM; k++) {
+                a->h[k] = (1.0f - alpha)*a->h[k] + alpha*f->h_archive[best_idx * H_DIM + k];
+            }
+            rmsnorm(a->h, H_DIM); // Consistency guard
+        }
+        return (float)max_sim;
+    }
+
+    SOV_API void sovereign_free_agent(void* a) {
         Agent* ag = (Agent*)a;
         if(ag->f) delete ag->f;
         delete ag;
