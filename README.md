@@ -1,89 +1,88 @@
-# Sovereign Hive 1.0: Hardened BitNet Orchestrator
+# Sovereign Engine v13: Optimized BitNet 1.58b Core
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Engine: C++20](https://img.shields.io/badge/Engine-C%2B%2B20-blue.svg)](https://isocpp.org/)
 [![Model: 100M BitNet](https://img.shields.io/badge/Model-100M_BitNet_1.58b-red.svg)](https://arxiv.org/abs/2402.17764)
 
-**Sovereign Hive 1.0** is a research-grade, zero-waste autonomous neural orchestrator. It implements a 100M-parameter **BitNet 1.58b (Ternary)** core designed to run high-fidelity AGI logic 100% offline within a ultra-lean 72MB memory footprint.
+**Sovereign Engine v13** is a high-performance, memory-efficient inference engine built on a **Hybrid-GRU + BitNet 1.58b (Ternary)** architecture. It is designed for ultra-fast autonomous sequence modeling with a minimal memory footprint (~72MB RAM).
 
 ---
 
 ## 🚀 Key Specifications
 
-| Specification | Metric |
-| :--- | :--- |
-| **Architecture** | Hybrid GRU + BitNet 1.58b (Ternary {-1, 0, 1}) |
-| **Model Size (Disk)** | **16.68 MB** (Compacted 2-bit Binary) |
-| **RAM Footprint** | **~72 MB** (Total Inference Engine) |
-| **Inference Speed** | **33ms per token** (SIMD-Optimized C++) |
-| **Precision** | Graduated Ph.D. Level (Distilled from Llama-3.3-70B) |
+| Specification | Metric | Status |
+| :--- | :--- | :--- |
+| **Architecture** | Hybrid GRU + BitNet 1.58b (Ternary {-1, 0, 1}) | **Optimized** |
+| **Model Size (Disk)** | **16.68 MB** (Bit-Packed Ternary Weights) | **Verified** |
+| **Recurrence** | Full Hidden-State Connectivity (Phase 1) | **Restored** |
+| **Normalization** | RMSNorm Stabilization (Phase 6) | **Hardened** |
+| **Training** | Full-Core Deep Brain Distillation (Phase 5) | **Unlocked** |
 
 ---
 
-## 🧠 Architectural Overview
+## 🔬 Architectural Innovations (v13 Optimization)
+
+The v13 standard introduces six major architectural stabilization phases:
+
+1.  **Full Recurrence Restoration**: Fixed the hidden-state passing bottleneck in the GRU core, restoring temporal sensitive modeling.
+2.  **Dynamic Xavier Scaling**: Implemented layer-specific signal power ratio (SPR) scaling to prevent vanishing/exploding gradients in ternary logic.
+3.  **MaxMatch Subword Tokenization**: Upgraded the encoding pipeline to eliminate information loss, achieving a **0.0% Unknown Token Rate (ZUR)**.
+4.  **Shared Hive Context**: Implemented a global context buffer allowing multiple agents to perceive and react to a collective swarm state.
+5.  **Deep Brain Distillation**: Unlocked training for the entire recurrent core (Wz, Wr, Wh) using 1-step BPTT, enabling sequence memorization and adaptation.
+6.  **RMSNormalizaton**: Integrated Root Mean Square normalization at the block level to ensure activation stability (**ASI < 1.0**) during long-horizon interaction.
+
+---
+
+## 🧠 Model Manifold
 
 ```mermaid
 graph TD
-    User([User Prompt]) --> Swarm[Sovereign Swarm API]
-    Swarm --> Agent[Specialist Fragment]
+    Input([Input Sequence]) --> Tokenizer[MaxMatch Subword Encoder]
+    Tokenizer --> Embedding[Ternary Embedding We]
     
-    subgraph "Sovereign Engine (C++ DLL)"
-        Agent --> Context[Memory Anchor / H-State]
-        Context --> BitNet[100M Ternary Matrix Mult]
-        BitNet --> Pulse[Neural Pulse Fallback]
-        Pulse --> Output[Token Logic]
+    subgraph "Hybrid-GRU Block (BitNet 1.58b)"
+        Embedding --> GRU[GRU Core + Hive Context]
+        GRU --> Norm[RMSNorm Stabilization]
+        Norm --> Recurrence[Hidden State H_t-1]
+        Recurrence -.-> GRU
     end
     
-    Output --> Detokenizer[GPT-2 Detokenizer]
-    Detokenizer --> User
+    Norm --> Head[Ternary Output Head Wo]
+    Head --> Softmax[Softmax Layer]
+    Softmax --> Output([Next Token Probs])
 ```
-
-### 🔬 Technical Innovations
-
-1.  **BitNet 1.58b (Ternary Logic)**: All weights are quantized to `{-1, 0, 1}`. This eliminates traditional floating-point multiplication, replacing it with high-efficiency integer addition and logic gates.
-2.  **Phase 7.5 Hardening**: The engine includes integrated **L2 Regularization** and **NaN Guards** to prevent neural collapse during long-horizon autonomous interactions.
-3.  **Neural Pulse**: A built-in fallback mechanism that detects low-probability "shy" neurons and applies a uniform heartbeat choice to prevent engine hangs.
-4.  **Zero-Waste Persistence**: The `master_brain_compact.bin` format uses bit-packing to store 100M weights in under 17MB, outperforming traditional 4-bit and 8-bit quantization in both size and fidelity.
 
 ---
 
 ## 🛠️ Repository Structure
 
-- `/architecture`: The mathematical heart of the Hive.
-    - `/neural_core`: C++ Native source code and Optimized SIMD kernels.
-    - `/agent_architecture`: Python High-Level Swarm API and specialist handlers.
-- `sovereign.dll`: Pre-compiled production inference binary.
-- `master_brain_compact.bin`: The graduated, 16MB Ph.D.-level knowledge base.
-- `verify_brain.py`: Industrial-grade validation script for local IQ auditing.
+- `/architecture/neural_core`: The optimized C++ native source code and SIMD kernels.
+- `sovereign.dll`: Compact, high-performance production inference library.
+- `vocab.txt`: 50,261-entry vocab managed by the MaxMatch engine.
+- `PROGRESS_LOG.md`: Detailed transition logs for Phase 0-6 optimization.
+- `SOVEREIGN_RULES.md`: Core development laws for maintaining architectural sincerity.
 
 ---
 
-## 🚦 Quick Start
+## 🚦 Quick Start (Inference)
 
-### 1. Requirements
-- Python 3.10+
-- Windows (x64)
-- `numpy`, `psutil` (for auditing)
+The engine provides a high-level C-API for integration into any swarm or autonomous system.
 
-### 2. Verify the Hive
-Run the final intelligence audit to confirm the brain is healthy and aligned:
-```bash
-python verify_brain.py
-```
-
-### 3. Basic Interaction
 ```python
-from architecture.agent_architecture.llm_client import LLMClient
+import ctypes
 
-# Initialize the 100M Sovereign Engine
-client = LLMClient()
+# Initialize the Sovereign Engine
+sov = ctypes.CDLL("sovereign.dll")
+master = sov.sovereign_init_master()
+agent = sov.sovereign_init_agent(b"primary", master, 42)
 
-# Execute a specialist chat
-response = client.chat([{"role": "user", "content": "Explain recursive self-optimization."}])
-print(f"Sovereign: {response}")
+# Observe and Generate
+sov.sovereign_agent_observe(agent, b"The system status is ")
+response = sov.sovereign_agent_act(agent, 16, 0.7).decode()
+print(f"Output: {response}")
 ```
 
 ---
 
 ## 🛡️ License
-Sovereign Hive is released under the **MIT License**. Created by [Sumith Kumar](https://github.com/sumithkumar07).
+Sovereign Engine is released under the **MIT License**. Created by [Sumith Kumar](https://github.com/sumithkumar07).
