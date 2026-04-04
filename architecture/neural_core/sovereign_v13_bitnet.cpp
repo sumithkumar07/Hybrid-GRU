@@ -1,0 +1,414 @@
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <iomanip>
+#include <algorithm>
+#include <random>
+#include <string>
+#include <fstream>
+#include <cstring>
+#include <ctime>
+#include <omp.h>
+#include "tokenizer.h"
+
+// --- DIMENSIONS ---
+static const int VOCAB = 50257; // GPT-2 Standard Vocabulary size
+static const int EMBED_DIM = 256;
+static const int H_DIM = 1024;
+static const int GRU_CONCAT = EMBED_DIM + H_DIM;
+static const int HIDDEN = 1024;
+
+// --- BITNET 1.58b UTILS ---
+// Ternary weights: -1, 0, 1 stored as int8_t for 2-bit efficiency
+typedef int8_t tweight; 
+
+inline double sigmoid(double x) { return 1.0 / (1.0 + std::exp(-x)); }
+inline double relu(double x) { return x > 0 ? x : 0; }
+
+void softmax(double* raw_logits, double* probs, int n) {
+    double max_l = -1e9;
+    for(int i=0; i<n; i++) {
+        if (std::isnan(raw_logits[i]) || std::isinf(raw_logits[i])) raw_logits[i] = -50.0; // NaN Guard
+        if(raw_logits[i] > max_l) max_l = raw_logits[i];
+    }
+    double sum = 0;
+    for(int i=0; i<n; i++) {
+        probs[i] = std::exp(raw_logits[i] - max_l);
+        sum += probs[i];
+    }
+    
+    // Neural Pulse: If brain is too shy, guess at random instead of hanging
+    if (sum < 1e-9) {
+        for(int i=0; i<n; i++) probs[i] = 1.0 / (double)n;
+    } else {
+        for(int i=0; i<n; i++) probs[i] /= sum;
+    }
+}
+
+// Optimized Ternary Matrix Multiplication
+// Instead of w*x, we do: sum += (w == 1) ? x : (w == -1) ? -x : 0
+inline double t_matmul(const tweight* w, const double* x, int n, double scale) {
+    double sum = 0;
+    #pragma omp simd reduction(+:sum)
+    for(int i=0; i<n; i++) {
+        if(w[i] == 1) sum += x[i];
+        else if(w[i] == -1) sum -= x[i];
+    }
+    return sum * scale;
+}
+
+// --- HYDRA FRAGMENTS ---
+struct Fragment {
+    std::string agent_id;
+    float personality_bias[H_DIM];
+    double h_memory[H_DIM]; // Memory Anchor (Persistent H-State)
+};
+
+// --- SOVEREIGN V13 ENGINE ---
+struct SovereignBlock {
+    // Ternary Weights (BitNet Inference)
+    tweight* We; // [VOCAB * EMBED_DIM]
+    tweight* Wz; // [H_DIM * GRU_CONCAT]
+    tweight* Wr; // [H_DIM * GRU_CONCAT]
+    tweight* Wh; // [H_DIM * GRU_CONCAT]
+    tweight* Wo; // [VOCAB * HIDDEN]
+    
+    // Scale Factors
+    double s_e, s_z, s_r, s_h, s_o;
+    
+    // Biases
+    double *bz, *br, *bh, *bo;
+
+    // Latent Buffers (Only for Training)
+    double *L_We=nullptr, *L_Wz=nullptr, *L_Wr=nullptr, *L_Wh=nullptr, *L_Wo=nullptr;
+
+    SovereignBlock() {
+        We = new tweight[VOCAB * EMBED_DIM];
+        Wz = new tweight[H_DIM * GRU_CONCAT];
+        Wr = new tweight[H_DIM * GRU_CONCAT];
+        Wh = new tweight[H_DIM * GRU_CONCAT];
+        Wo = new tweight[VOCAB * HIDDEN];
+        
+        bz = new double[H_DIM]; br = new double[H_DIM]; bh = new double[H_DIM]; bo = new double[VOCAB];
+        s_e = s_z = s_r = s_h = s_o = 0.05;
+    }
+
+    void enable_training() {
+        if (!L_We) {
+            L_We = new double[VOCAB * EMBED_DIM];
+            L_Wz = new double[H_DIM * GRU_CONCAT];
+            L_Wr = new double[H_DIM * GRU_CONCAT];
+            L_Wh = new double[H_DIM * GRU_CONCAT];
+            L_Wo = new double[VOCAB * HIDDEN];
+            // Initialize latent buffers from ternary weights to maintain state
+            for(int i=0; i<VOCAB*EMBED_DIM; i++) L_We[i] = (We[i] == 1) ? s_e : (We[i] == -1) ? -s_e : 0;
+            // ... (others similarly if needed for full resume)
+        }
+    }
+
+    void quantize() {
+        // BitNet 1.58b Quantization: sign(W - mean(W))
+        auto q = [](double* latent, tweight* ternary, int n) {
+            double sum = 0; for(int i=0; i<n; i++) sum += latent[i];
+            double avg = sum / n;
+            for(int i=0; i<n; i++) ternary[i] = (latent[i] - avg > 0.1) ? 1 : (latent[i] - avg < -0.1) ? -1 : 0;
+        };
+        if (L_We) {
+            q(L_We, We, VOCAB * EMBED_DIM);
+            q(L_Wz, Wz, H_DIM * GRU_CONCAT);
+            q(L_Wr, Wr, H_DIM * GRU_CONCAT);
+            q(L_Wh, Wh, H_DIM * GRU_CONCAT);
+            q(L_Wo, Wo, VOCAB * HIDDEN);
+        }
+    }
+
+    void save(const char* p) {
+        // Obsolete (Latent format) - Use sovereign_save_compact
+    }
+};
+
+struct Agent {
+    SovereignBlock* m;
+    Fragment* f;
+    double h[H_DIM];
+    double* logits;
+    double* probs;
+    std::mt19937 gen;
+    
+    Agent(SovereignBlock* master, Fragment* frag, int seed) 
+        : m(master), f(frag), gen(seed) { 
+        std::memset(h, 0, 8*H_DIM); 
+        logits = new double[VOCAB];
+        probs = new double[VOCAB];
+    }
+    ~Agent() {
+        delete[] logits;
+        delete[] probs;
+    }
+};
+
+static WordTokenizer* g_tok = nullptr;
+
+#ifdef _WIN32
+#define EXPORT __declspec(dllexport)
+#else
+#define EXPORT
+#endif
+
+extern "C" {
+    EXPORT void sovereign_save_compact(void* master, const char* path) {
+        if(!master || !path) return;
+        SovereignBlock* m = (SovereignBlock*)master;
+        std::ofstream f(path, std::ios::binary); if(!f) return;
+        
+        // Pack back from ternary to 2-bit storage
+        auto pack = [&](tweight* ternary, int n, double scale) {
+            f.write((char*)&scale, 8); // Save Scale Factor
+            int packed_size = (n + 3) / 4;
+            unsigned char* packed = new unsigned char[packed_size];
+            std::memset(packed, 0, packed_size);
+            for(int i=0; i<n; i++) {
+                unsigned char val = (ternary[i] == 1) ? 2 : (ternary[i] == -1) ? 0 : 1;
+                packed[i/4] |= (val << (2 * (i%4)));
+            }
+            f.write((char*)packed, packed_size);
+            delete[] packed;
+        };
+        
+        pack(m->We, VOCAB * EMBED_DIM, m->s_e);
+        pack(m->Wz, H_DIM * GRU_CONCAT, m->s_z); f.write((char*)m->bz, 8 * H_DIM);
+        pack(m->Wr, H_DIM * GRU_CONCAT, m->s_r); f.write((char*)m->br, 8 * H_DIM);
+        pack(m->Wh, H_DIM * GRU_CONCAT, m->s_h); f.write((char*)m->bh, 8 * H_DIM);
+        pack(m->Wo, VOCAB * HIDDEN, m->s_o); f.write((char*)m->bo, 8 * VOCAB);
+    }
+
+    EXPORT void sovereign_load_compact(void* master, const char* path) {
+        if(!master || !path) return;
+        SovereignBlock* m = (SovereignBlock*)master;
+        std::ifstream f(path, std::ios::binary); if(!f) return;
+        
+        // Unpack directly into ternary without latent bloat
+        auto unpack = [&](tweight* ternary, int n, double& scale) {
+            f.read((char*)&scale, 8); // Load Scale Factor (8 bytes)
+            int packed_size = (n + 3) / 4;
+            unsigned char* packed = new unsigned char[packed_size];
+            f.read((char*)packed, packed_size);
+            
+            #pragma omp parallel for
+            for(int i=0; i<packed_size; i++) {
+                unsigned char b = packed[i];
+                for(int j=0; j<4; j++) {
+                    int idx = i*4 + j;
+                    if(idx < n) {
+                        int val = (b >> (j*2)) & 0x03;
+                        ternary[idx] = (val == 1) ? 1 : (val == 2) ? -1 : 0;
+                    }
+                }
+            }
+            delete[] packed;
+        };
+
+        unpack(m->We, VOCAB * EMBED_DIM, m->s_e);
+        unpack(m->Wz, H_DIM * GRU_CONCAT, m->s_z); f.read((char*)m->bz, 8 * H_DIM);
+        unpack(m->Wr, H_DIM * GRU_CONCAT, m->s_r); f.read((char*)m->br, 8 * H_DIM);
+        unpack(m->Wh, H_DIM * GRU_CONCAT, m->s_h); f.read((char*)m->bh, 8 * H_DIM);
+        unpack(m->Wo, VOCAB * HIDDEN, m->s_o); f.read((char*)m->bo, 8 * VOCAB);
+    }
+
+    EXPORT int sovereign_tokenize(const char* word) {
+        if(!g_tok || !word) return 0;
+        auto it = g_tok->word_to_id.find(std::string(word));
+        return (it != g_tok->word_to_id.end()) ? it->second : 0;
+    }
+
+    EXPORT const char* sovereign_detokenize(int idx) {
+        if(!g_tok || idx < 0 || idx >= (int)g_tok->id_to_word.size()) return "";
+        return g_tok->id_to_word[idx].c_str();
+    }
+
+    EXPORT void* sovereign_init_master() {
+        if(!g_tok) { g_tok = new WordTokenizer(); g_tok->load_vocab("vocab.txt"); }
+        SovereignBlock* b = new SovereignBlock(); 
+        // Zero-RAM randomization: initialize ternary directly or enable training temporarily
+        std::mt19937 g(42);
+        std::uniform_real_distribution<double> d(-1.0, 1.0);
+        for(int i=0; i<VOCAB*EMBED_DIM; i++) b->We[i] = (d(g) > 0) ? 1 : -1;
+        return (void*)b;
+    }
+
+    EXPORT void sovereign_free_master(void* master) {
+        if(!master) return;
+        delete (SovereignBlock*)master;
+    }
+
+    EXPORT void sovereign_train_step_distill(void* agent_ptr, int input_token, float* teacher_probs, float lr) {
+        if(!agent_ptr || !teacher_probs) return;
+        Agent* a = (Agent*)agent_ptr;
+        
+        // Feed-Forward Logits
+        for(int v=0; v<VOCAB; v++) {
+            a->logits[v] = t_matmul(&a->m->Wo[v * HIDDEN], a->h, HIDDEN, a->m->s_o) + a->m->bo[v];
+        }
+        softmax(a->logits, a->probs, VOCAB);
+
+        // Targeted Backprop (Inplace Latent Weight Update)
+        #pragma omp parallel for
+        for(int v=0; v<VOCAB; v++) {
+            double grad = a->probs[v] - (double)teacher_probs[v];
+            
+            // L2 Penalty (0.01) - Neural Pressure Valve
+            double l2_lambda = 0.01;
+            
+            for(int k=0; k<HIDDEN; k++) {
+                double weight = a->m->L_Wo[v * HIDDEN + k];
+                a->m->L_Wo[v * HIDDEN + k] -= lr * (grad * a->h[k] + l2_lambda * weight);
+                
+                // Absolute Clip (Neural Hardening)
+                if (a->m->L_Wo[v * HIDDEN + k] > 2.0) a->m->L_Wo[v * HIDDEN + k] = 2.0;
+                if (a->m->L_Wo[v * HIDDEN + k] < -2.0) a->m->L_Wo[v * HIDDEN + k] = -2.0;
+            }
+            a->m->bo[v] -= lr * grad;
+        }
+    }
+
+    EXPORT void sovereign_train_distill_bulk(void* agent_ptr, int* tokens, int n, float lr) {
+        if(!agent_ptr || !tokens) return;
+        Agent* a = (Agent*)agent_ptr;
+        a->m->enable_training();
+        
+        for(int i=0; i<n; i++) {
+            // Simulate single-token distribution (Targeted)
+            float target[VOCAB];
+            std::memset(target, 0, 4 * VOCAB);
+            target[tokens[i]] = 1.0f;
+            sovereign_train_step_distill(agent_ptr, tokens[i], target, lr);
+        }
+        
+        // Single quantization pass for the entire batch (CRITICAL FOR SPEED)
+        a->m->quantize();
+    }
+
+    EXPORT void* sovereign_init_fragment(const char* id) {
+        if(!id) return nullptr;
+        Fragment* f = new Fragment();
+        f->agent_id = std::string(id);
+        std::memset(f->personality_bias, 0, 4 * H_DIM);
+        std::memset(f->h_memory, 0, 8 * H_DIM); // Initialize memory anchor to zero
+        return (void*)f;
+    }
+
+    EXPORT void sovereign_set_fragment_bias(void* fragment_ptr, float* bias_data) {
+        if(!fragment_ptr || !bias_data) return;
+        std::memcpy(((Fragment*)fragment_ptr)->personality_bias, bias_data, 4 * H_DIM);
+    }
+
+    EXPORT float* sovereign_get_fragment_bias(void* fragment_ptr) {
+        if(!fragment_ptr) return nullptr;
+        return ((Fragment*)fragment_ptr)->personality_bias;
+    }
+
+    EXPORT void sovereign_agent_save_state(void* agent_ptr, void* fragment_ptr) {
+        if(!agent_ptr || !fragment_ptr) return;
+        Agent* a = (Agent*)agent_ptr;
+        Fragment* f = (Fragment*)fragment_ptr;
+        std::memcpy(f->h_memory, a->h, 8 * H_DIM);
+    }
+
+    EXPORT void sovereign_agent_load_state(void* agent_ptr, void* fragment_ptr) {
+        if(!agent_ptr || !fragment_ptr) return;
+        Agent* a = (Agent*)agent_ptr;
+        Fragment* f = (Fragment*)fragment_ptr;
+        std::memcpy(a->h, f->h_memory, 8 * H_DIM);
+    }
+
+    EXPORT void sovereign_agent_set_fragment(void* agent_ptr, void* fragment_ptr) {
+        if(!agent_ptr || !fragment_ptr) return;
+        Agent* a = (Agent*)agent_ptr;
+        
+        // Auto-Save outgoing state if fragment exists
+        if(a->f) sovereign_agent_save_state(agent_ptr, (void*)a->f);
+        
+        // Switch Fragment
+        a->f = (Fragment*)fragment_ptr;
+        
+        // Auto-Load incoming state (Memory Anchor)
+        sovereign_agent_load_state(agent_ptr, fragment_ptr);
+    }
+
+    EXPORT void* sovereign_init_agent(const char* id, void* master, int seed) {
+        if(!id || !master) return nullptr;
+        Fragment* f = new Fragment();
+        f->agent_id = std::string(id);
+        for(int i=0; i<H_DIM; i++) f->personality_bias[i] = 0.0f; 
+        return (void*)new Agent((SovereignBlock*)master, f, seed);
+    }
+
+    EXPORT void sovereign_agent_observe(void* agent_ptr, const char* text) {
+        if(!text || !agent_ptr) return;
+        Agent* a = (Agent*)agent_ptr;
+        std::vector<int> tokens = g_tok->encode(std::string(text));
+        for(int tok : tokens) {
+            if (tok < 0 || tok >= VOCAB) tok = 0;
+            double gru_in[EMBED_DIM];
+            for(int d=0; d<EMBED_DIM; d++) {
+                tweight w = a->m->We[tok * EMBED_DIM + d];
+                gru_in[d] = (w == 1) ? a->m->s_e : (w == -1) ? -a->m->s_e : 0;
+            }
+            double h_new[H_DIM];
+            #pragma omp parallel for
+            for(int k=0; k<H_DIM; k++) {
+                double pz = a->m->bz[k] + t_matmul(&a->m->Wz[k * GRU_CONCAT], gru_in, EMBED_DIM, a->m->s_z);
+                double pr = a->m->br[k] + t_matmul(&a->m->Wr[k * GRU_CONCAT], gru_in, EMBED_DIM, a->m->s_r);
+                double z = sigmoid(pz);
+                double phc = a->m->bh[k] + t_matmul(&a->m->Wh[k * GRU_CONCAT], gru_in, EMBED_DIM, a->m->s_h);
+                h_new[k] = (1.0-z)*a->h[k] + z*std::tanh(phc + (a->f->personality_bias[k] * 0.1f));
+            }
+            std::memcpy(a->h, h_new, 8*H_DIM);
+        }
+    }
+
+    EXPORT const char* sovereign_agent_act(void* agent_ptr, int max_len, double temp) {
+        if(!agent_ptr) return "";
+        Agent* a = (Agent*)agent_ptr;
+        std::vector<int> response;
+        int last_tok = 2;
+        static char out[8192]; 
+        for(int i=0; i<max_len; i++) {
+            double gru_in[EMBED_DIM];
+            for(int d=0; d<EMBED_DIM; d++) {
+                tweight w = a->m->We[last_tok * EMBED_DIM + d];
+                gru_in[d] = (w == 1) ? a->m->s_e : (w == -1) ? -a->m->s_e : 0;
+            }
+            double h_new[H_DIM];
+            #pragma omp parallel for
+            for(int k=0; k<H_DIM; k++) {
+                double pz = a->m->bz[k] + t_matmul(&a->m->Wz[k * GRU_CONCAT], gru_in, EMBED_DIM, a->m->s_z);
+                double pr = a->m->br[k] + t_matmul(&a->m->Wr[k * GRU_CONCAT], gru_in, EMBED_DIM, a->m->s_r);
+                double z = sigmoid(pz);
+                double phc = a->m->bh[k] + t_matmul(&a->m->Wh[k * GRU_CONCAT], gru_in, EMBED_DIM, a->m->s_h);
+                h_new[k] = (1.0-z)*a->h[k] + z*std::tanh(phc + (a->f->personality_bias[k] * 0.1f));
+            }
+            std::memcpy(a->h, h_new, 8*H_DIM);
+            for(int v=0; v<VOCAB; v++) {
+                a->logits[v] = t_matmul(&a->m->Wo[v * HIDDEN], a->h, HIDDEN, a->m->s_o) + a->m->bo[v];
+                a->logits[v] /= (temp + 1e-6);
+            }
+            softmax(a->logits, a->probs, VOCAB);
+            
+            std::discrete_distribution<int> d(a->probs, a->probs+VOCAB);
+            int next = d(a->gen);
+            if(next == 3) break;
+            response.push_back(next);
+            last_tok = next;
+        }
+        std::string res = g_tok->decode(response);
+        std::strncpy(out, res.c_str(), 8191);
+        return out;
+    }
+
+    EXPORT void sovereign_free_agent(void* a) {
+        Agent* ag = (Agent*)a;
+        if(ag->f) delete ag->f;
+        delete ag;
+    }
+}
