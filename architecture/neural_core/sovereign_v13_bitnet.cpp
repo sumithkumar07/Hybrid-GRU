@@ -12,9 +12,9 @@
 #include "tokenizer.h"
 
 #ifdef _WIN32
-#define SOV_API extern "C" __declspec(dllexport)
+#define SOV_API __declspec(dllexport)
 #else
-#define SOV_API extern "C"
+#define SOV_API
 #endif
 
 
@@ -83,13 +83,15 @@ struct Fragment {
     double* h_archive = nullptr;
     int archive_count = 0;
     int archive_head = 0;
-    const int ARCHIVE_CAP = 1024;
+    const int ARCHIVE_CAP = 128; // Optimized for 1000-agent swarm (1MB/agent)
 
     Fragment() {
         h_archive = new double[ARCHIVE_CAP * H_DIM];
-        std::memset(h_archive, 0, sizeof(double) * ARCHIVE_CAP * H_DIM);
+        std::memset(personality_bias, 0, 4 * H_DIM);
+        std::memset(h_archive, 0, 8 * ARCHIVE_CAP * H_DIM);
+        std::memset(h_memory, 0, 8 * H_DIM);
     }
-    ~Fragment() { delete[] h_archive; }
+    ~Fragment() { if(h_archive) delete[] h_archive; }
 };
 
 // --- SOVEREIGN V13 ENGINE ---
@@ -187,20 +189,13 @@ struct Agent {
     SovereignBlock* m;
     Fragment* f;
     double h[H_DIM];
-    double* logits;
-    double* probs;
     std::mt19937 gen;
     
     Agent(SovereignBlock* master, Fragment* frag, int seed) 
         : m(master), f(frag), gen(seed) { 
         std::memset(h, 0, 8*H_DIM); 
-        logits = new double[VOCAB];
-        probs = new double[VOCAB];
     }
-    ~Agent() {
-        delete[] logits;
-        delete[] probs;
-    }
+    ~Agent() {}
 };
 
 static WordTokenizer* g_tok = nullptr;
@@ -279,6 +274,15 @@ SOV_API void sovereign_save_compact(void* master, const char* path) {
         std::memcpy(m->hive_context, vector, 8 * H_DIM);
     }
 
+    SOV_API void sovereign_hive_consensus(void* master, double* agent_h, double factor) {
+        if(!master || !agent_h) return;
+        SovereignBlock* m = (SovereignBlock*)master;
+        for(int i=0; i<H_DIM; i++) {
+            m->hive_context[i] = (1.0 - factor)*m->hive_context[i] + factor*agent_h[i];
+        }
+        rmsnorm(m->hive_context, H_DIM);
+    }
+
     SOV_API int sovereign_tokenize(const char* word) {
         if(!g_tok || !word) return TOK_PAD;
         std::vector<int> tokens = g_tok->encode(std::string(word));
@@ -321,11 +325,14 @@ SOV_API void sovereign_save_compact(void* master, const char* path) {
         if(!agent_ptr || !teacher_probs) return;
         Agent* a = (Agent*)agent_ptr;
         
+        thread_local double s_logits[VOCAB];
+        thread_local double s_probs[VOCAB];
+        
         // Feed-Forward Logits
         for(int v=0; v<VOCAB; v++) {
-            a->logits[v] = t_matmul(&a->m->Wo[v * HIDDEN], a->h, HIDDEN, a->m->s_o) + a->m->bo[v];
+            s_logits[v] = t_matmul(&a->m->Wo[v * HIDDEN], a->h, HIDDEN, a->m->s_o) + a->m->bo[v];
         }
-        softmax(a->logits, a->probs, VOCAB);
+        softmax(s_logits, s_probs, VOCAB);
 
         // 1. Output Gradient (Softmax -> Logits)
         double dh[H_DIM];
@@ -333,7 +340,7 @@ SOV_API void sovereign_save_compact(void* master, const char* path) {
         
         #pragma omp parallel for
         for(int v=0; v<VOCAB; v++) {
-            double grad = a->probs[v] - (double)teacher_probs[v];
+            double grad = s_probs[v] - (double)teacher_probs[v];
             for(int k=0; k<HIDDEN; k++) {
                 // Update Wo (Latent)
                 a->m->L_Wo[v * HIDDEN + k] -= lr * (grad * a->h[k] + 0.001 * a->m->L_Wo[v * HIDDEN + k]);
@@ -473,7 +480,10 @@ SOV_API void sovereign_save_compact(void* master, const char* path) {
         Agent* a = (Agent*)agent_ptr;
         std::vector<int> response;
         int last_tok = 2;
-        static char out[8192]; 
+        thread_local double s_logits[VOCAB];
+        thread_local double s_probs[VOCAB];
+        thread_local char out[8192]; 
+
         for(int i=0; i<max_len; i++) {
             double gru_in[EMBED_DIM];
             for(int d=0; d<EMBED_DIM; d++) {
@@ -504,12 +514,12 @@ SOV_API void sovereign_save_compact(void* master, const char* path) {
             rmsnorm(h_new, H_DIM);
             std::memcpy(a->h, h_new, 8*H_DIM);
             for(int v=0; v<VOCAB; v++) {
-                a->logits[v] = t_matmul(&a->m->Wo[v * HIDDEN], a->h, HIDDEN, a->m->s_o) + a->m->bo[v];
-                a->logits[v] /= (temp + 1e-6);
+                s_logits[v] = t_matmul(&a->m->Wo[v * HIDDEN], a->h, HIDDEN, a->m->s_o) + a->m->bo[v];
+                s_logits[v] /= (temp + 1e-6);
             }
-            softmax(a->logits, a->probs, VOCAB);
+            softmax(s_logits, s_probs, VOCAB);
             
-            std::discrete_distribution<int> d(a->probs, a->probs+VOCAB);
+            std::discrete_distribution<int> d(s_probs, s_probs+VOCAB);
             int next = d(a->gen);
             if(next == 3) break;
             response.push_back(next);
