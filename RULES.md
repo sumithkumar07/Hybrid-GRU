@@ -1,6 +1,6 @@
-# SOVEREIGN DEVELOPMENT RULES
+# hybrid_gru DEVELOPMENT RULES
 
-These rules override all other instructions. They are the foundation of the Sovereign Engine development process.
+These rules override all other instructions. They are the foundation of the hybrid_gru Engine development process.
 
 ### Rule 1: Master Before Move
 > Do NOT move to the next phase until the current phase is **verified with numbers**.

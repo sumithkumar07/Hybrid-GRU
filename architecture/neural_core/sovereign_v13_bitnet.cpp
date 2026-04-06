@@ -94,8 +94,8 @@ struct Fragment {
     ~Fragment() { if(h_archive) delete[] h_archive; }
 };
 
-// --- SOVEREIGN V13 ENGINE ---
-struct SovereignBlock {
+// --- hybrid_gru V13 ENGINE ---
+struct hybrid_gruBlock {
     // Ternary Weights (BitNet Inference)
     tweight* We; // [VOCAB * EMBED_DIM]
     tweight* Wz; // [H_DIM * GRU_CONCAT]
@@ -115,7 +115,7 @@ struct SovereignBlock {
     // Phase 4: Shared Swarm Memory
     double *hive_context;
 
-    SovereignBlock() {
+    hybrid_gruBlock() {
         We = new tweight[VOCAB * EMBED_DIM];
         Wz = new tweight[H_DIM * GRU_CONCAT];
         Wr = new tweight[H_DIM * GRU_CONCAT];
@@ -181,17 +181,17 @@ struct SovereignBlock {
     }
 
     void save(const char* p) {
-        // Obsolete (Latent format) - Use sovereign_save_compact
+        // Obsolete (Latent format) - Use hybrid_gru_save_compact
     }
 };
 
 struct Agent {
-    SovereignBlock* m;
+    hybrid_gruBlock* m;
     Fragment* f;
     double h[H_DIM];
     std::mt19937 gen;
     
-    Agent(SovereignBlock* master, Fragment* frag, int seed) 
+    Agent(hybrid_gruBlock* master, Fragment* frag, int seed) 
         : m(master), f(frag), gen(seed) { 
         std::memset(h, 0, 8*H_DIM); 
     }
@@ -208,9 +208,9 @@ static WordTokenizer* g_tok = nullptr;
 
 extern "C" {
 
-SOV_API void sovereign_save_compact(void* master, const char* path) {
+SOV_API void hybrid_gru_save_compact(void* master, const char* path) {
         if(!master || !path) return;
-        SovereignBlock* m = (SovereignBlock*)master;
+        hybrid_gruBlock* m = (hybrid_gruBlock*)master;
         std::ofstream f(path, std::ios::binary); if(!f) return;
         
         // Pack back from ternary to 2-bit storage
@@ -234,9 +234,9 @@ SOV_API void sovereign_save_compact(void* master, const char* path) {
         pack(m->Wo, VOCAB * HIDDEN, m->s_o); f.write((char*)m->bo, 8 * VOCAB);
     }
 
-    SOV_API void sovereign_load_compact(void* master, const char* path) {
+    SOV_API void hybrid_gru_load_compact(void* master, const char* path) {
         if(!master || !path) return;
-        SovereignBlock* m = (SovereignBlock*)master;
+        hybrid_gruBlock* m = (hybrid_gruBlock*)master;
         std::ifstream f(path, std::ios::binary); if(!f) return;
         
         // Unpack directly into ternary without latent bloat
@@ -268,22 +268,22 @@ SOV_API void sovereign_save_compact(void* master, const char* path) {
     }
 
 
-    SOV_API void sovereign_hive_broadcast(void* master, double* vector) {
+    SOV_API void hybrid_gru_hive_broadcast(void* master, double* vector) {
         if(!master || !vector) return;
-        SovereignBlock* m = (SovereignBlock*)master;
+        hybrid_gruBlock* m = (hybrid_gruBlock*)master;
         std::memcpy(m->hive_context, vector, 8 * H_DIM);
     }
 
-    SOV_API void sovereign_hive_consensus(void* master, double* agent_h, double factor) {
+    SOV_API void hybrid_gru_hive_consensus(void* master, double* agent_h, double factor) {
         if(!master || !agent_h) return;
-        SovereignBlock* m = (SovereignBlock*)master;
+        hybrid_gruBlock* m = (hybrid_gruBlock*)master;
         for(int i=0; i<H_DIM; i++) {
             m->hive_context[i] = (1.0 - factor)*m->hive_context[i] + factor*agent_h[i];
         }
         rmsnorm(m->hive_context, H_DIM);
     }
 
-    SOV_API int sovereign_tokenize(const char* word) {
+    SOV_API int hybrid_gru_tokenize(const char* word) {
         if(!g_tok || !word) return TOK_PAD;
         std::vector<int> tokens = g_tok->encode(std::string(word));
         // encode returns [START, T1, T2, ..., END]
@@ -292,14 +292,14 @@ SOV_API void sovereign_save_compact(void* master, const char* path) {
         return TOK_UNK;
     }
 
-    SOV_API const char* sovereign_detokenize(int idx) {
+    SOV_API const char* hybrid_gru_detokenize(int idx) {
         if(!g_tok || idx < 0 || idx >= (int)g_tok->id_to_word.size()) return "";
         return g_tok->id_to_word[idx].c_str();
     }
 
-    SOV_API void* sovereign_init_master() {
+    SOV_API void* hybrid_gru_init_master() {
         if(!g_tok) { g_tok = new WordTokenizer(); g_tok->load_vocab("vocab.txt"); }
-        SovereignBlock* b = new SovereignBlock(); 
+        hybrid_gruBlock* b = new hybrid_gruBlock(); 
         // Zero-RAM randomization: initialize ternary directly or enable training temporarily
         std::mt19937 g(42);
         std::uniform_real_distribution<double> d(-1.0, 1.0);
@@ -316,12 +316,12 @@ SOV_API void sovereign_save_compact(void* master, const char* path) {
         return (void*)b;
     }
 
-    SOV_API void sovereign_free_master(void* master) {
+    SOV_API void hybrid_gru_free_master(void* master) {
         if(!master) return;
-        delete (SovereignBlock*)master;
+        delete (hybrid_gruBlock*)master;
     }
 
-    SOV_API void sovereign_train_step_distill(void* agent_ptr, int input_token, float* teacher_probs, float lr) {
+    SOV_API void hybrid_gru_train_step_distill(void* agent_ptr, int input_token, float* teacher_probs, float lr) {
         if(!agent_ptr || !teacher_probs) return;
         Agent* a = (Agent*)agent_ptr;
         
@@ -366,7 +366,7 @@ SOV_API void sovereign_save_compact(void* master, const char* path) {
         }
     }
 
-    SOV_API void sovereign_train_distill_bulk(void* agent_ptr, int* tokens, int n, float lr) {
+    SOV_API void hybrid_gru_train_distill_bulk(void* agent_ptr, int* tokens, int n, float lr) {
         if(!agent_ptr || !tokens) return;
         Agent* a = (Agent*)agent_ptr;
         a->m->enable_training();
@@ -376,14 +376,14 @@ SOV_API void sovereign_save_compact(void* master, const char* path) {
             float target[VOCAB];
             std::memset(target, 0, 4 * VOCAB);
             target[tokens[i]] = 1.0f;
-            sovereign_train_step_distill(agent_ptr, tokens[i], target, lr);
+            hybrid_gru_train_step_distill(agent_ptr, tokens[i], target, lr);
         }
         
         // Single quantization pass for the entire batch (CRITICAL FOR SPEED)
         a->m->quantize();
     }
 
-    SOV_API void* sovereign_init_fragment(const char* id) {
+    SOV_API void* hybrid_gru_init_fragment(const char* id) {
         if(!id) return nullptr;
         Fragment* f = new Fragment();
         f->agent_id = std::string(id);
@@ -392,53 +392,53 @@ SOV_API void sovereign_save_compact(void* master, const char* path) {
         return (void*)f;
     }
 
-    SOV_API void sovereign_set_fragment_bias(void* fragment_ptr, float* bias_data) {
+    SOV_API void hybrid_gru_set_fragment_bias(void* fragment_ptr, float* bias_data) {
         if(!fragment_ptr || !bias_data) return;
         std::memcpy(((Fragment*)fragment_ptr)->personality_bias, bias_data, 4 * H_DIM);
     }
 
-    SOV_API float* sovereign_get_fragment_bias(void* fragment_ptr) {
+    SOV_API float* hybrid_gru_get_fragment_bias(void* fragment_ptr) {
         if(!fragment_ptr) return nullptr;
         return ((Fragment*)fragment_ptr)->personality_bias;
     }
 
-    SOV_API void sovereign_agent_save_state(void* agent_ptr, void* fragment_ptr) {
+    SOV_API void hybrid_gru_agent_save_state(void* agent_ptr, void* fragment_ptr) {
         if(!agent_ptr || !fragment_ptr) return;
         Agent* a = (Agent*)agent_ptr;
         Fragment* f = (Fragment*)fragment_ptr;
         std::memcpy(f->h_memory, a->h, 8 * H_DIM);
     }
 
-    SOV_API void sovereign_agent_load_state(void* agent_ptr, void* fragment_ptr) {
+    SOV_API void hybrid_gru_agent_load_state(void* agent_ptr, void* fragment_ptr) {
         if(!agent_ptr || !fragment_ptr) return;
         Agent* a = (Agent*)agent_ptr;
         Fragment* f = (Fragment*)fragment_ptr;
         std::memcpy(a->h, f->h_memory, 8 * H_DIM);
     }
 
-    SOV_API void sovereign_agent_set_fragment(void* agent_ptr, void* fragment_ptr) {
+    SOV_API void hybrid_gru_agent_set_fragment(void* agent_ptr, void* fragment_ptr) {
         if(!agent_ptr || !fragment_ptr) return;
         Agent* a = (Agent*)agent_ptr;
         
         // Auto-Save outgoing state if fragment exists
-        if(a->f) sovereign_agent_save_state(agent_ptr, (void*)a->f);
+        if(a->f) hybrid_gru_agent_save_state(agent_ptr, (void*)a->f);
         
         // Switch Fragment
         a->f = (Fragment*)fragment_ptr;
         
         // Auto-Load incoming state (Memory Anchor)
-        sovereign_agent_load_state(agent_ptr, fragment_ptr);
+        hybrid_gru_agent_load_state(agent_ptr, fragment_ptr);
     }
 
-    SOV_API void* sovereign_init_agent(const char* id, void* master, int seed) {
+    SOV_API void* hybrid_gru_init_agent(const char* id, void* master, int seed) {
         if(!id || !master) return nullptr;
         Fragment* f = new Fragment();
         f->agent_id = std::string(id);
         for(int i=0; i<H_DIM; i++) f->personality_bias[i] = 0.0f; 
-        return (void*)new Agent((SovereignBlock*)master, f, seed);
+        return (void*)new Agent((hybrid_gruBlock*)master, f, seed);
     }
 
-    SOV_API void sovereign_agent_observe(void* agent_ptr, const char* text) {
+    SOV_API void hybrid_gru_agent_observe(void* agent_ptr, const char* text) {
         if(!text || !agent_ptr) return;
         Agent* a = (Agent*)agent_ptr;
         std::vector<int> tokens = g_tok->encode(std::string(text));
@@ -475,7 +475,7 @@ SOV_API void sovereign_save_compact(void* master, const char* path) {
         }
     }
 
-    SOV_API const char* sovereign_agent_act(void* agent_ptr, int max_len, double temp) {
+    SOV_API const char* hybrid_gru_agent_act(void* agent_ptr, int max_len, double temp) {
         if(!agent_ptr) return "";
         Agent* a = (Agent*)agent_ptr;
         std::vector<int> response;
@@ -530,12 +530,12 @@ SOV_API void sovereign_save_compact(void* master, const char* path) {
         return out;
     }
 
-    SOV_API double* sovereign_agent_get_h(void* agent_ptr) {
+    SOV_API double* hybrid_gru_agent_get_h(void* agent_ptr) {
         if(!agent_ptr) return nullptr;
         return ((Agent*)agent_ptr)->h;
     }
 
-    SOV_API void sovereign_agent_commit_memory(void* agent_ptr) {
+    SOV_API void hybrid_gru_agent_commit_memory(void* agent_ptr) {
         if(!agent_ptr) return;
         Agent* a = (Agent*)agent_ptr;
         Fragment* f = a->f;
@@ -547,7 +547,7 @@ SOV_API void sovereign_save_compact(void* master, const char* path) {
         if(f->archive_count < f->ARCHIVE_CAP) f->archive_count++;
     }
 
-    SOV_API float sovereign_agent_recall_memory(void* agent_ptr, float alpha) {
+    SOV_API float hybrid_gru_agent_recall_memory(void* agent_ptr, float alpha) {
         if(!agent_ptr || alpha <= 0.0f) return 0.0f;
         Agent* a = (Agent*)agent_ptr;
         Fragment* f = a->f;
@@ -581,7 +581,7 @@ SOV_API void sovereign_save_compact(void* master, const char* path) {
         return (float)max_sim;
     }
 
-    SOV_API void sovereign_free_agent(void* a) {
+    SOV_API void hybrid_gru_free_agent(void* a) {
         Agent* ag = (Agent*)a;
         if(ag->f) delete ag->f;
         delete ag;

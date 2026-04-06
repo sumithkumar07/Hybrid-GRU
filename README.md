@@ -71,7 +71,7 @@ graph TD
 ## 🛠️ Repository Structure
 
 - `/architecture/neural_core`: Optimized C++ source code and bitwise kernels.
-- `/bin`: Compiled production library (`sovereign.dll`).
+- `/bin`: Compiled production library (`hybrid_gru.dll`).
 - `vocab.txt`: 50,261-entry vocabulary.
 - `PROGRESS_LOG.md`: Implementation history and phase-by-phase updates.
 
@@ -83,13 +83,13 @@ graph TD
 import ctypes
 
 # Initialize the Engine
-sov = ctypes.CDLL("bin/sovereign.dll")
-master = sov.sovereign_init_master()
-agent = sov.sovereign_init_agent(b"primary", master, 42)
+sov = ctypes.CDLL("bin/hybrid_gru.dll")
+master = sov.hybrid_gru_init_master()
+agent = sov.hybrid_gru_init_agent(b"primary", master, 42)
 
 # Observe and Generate
-sov.sovereign_agent_observe(agent, b"The system status is ")
-response = sov.sovereign_agent_act(agent, 16, 0.7).decode()
+sov.hybrid_gru_agent_observe(agent, b"The system status is ")
+response = sov.hybrid_gru_agent_act(agent, 16, 0.7).decode()
 print(f"Output: {response}")
 ```
 
